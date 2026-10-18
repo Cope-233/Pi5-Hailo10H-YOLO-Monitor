@@ -2,12 +2,13 @@
 
 import unittest
 from dataclasses import replace
+from unittest.mock import patch, MagicMock
 from datetime import datetime
 
 import cv2
 import numpy as np
 
-from monitor import MonitorState, Settings, decode_scale, letterbox, nms_xyxy
+from monitor import MonitorState, Settings, UVCCamera, decode_scale, letterbox, nms_xyxy
 
 
 class MonitorTests(unittest.TestCase):
@@ -71,6 +72,45 @@ class MonitorTests(unittest.TestCase):
         s.record_person(21, datetime.now(), None, None, settings)
         self.assertFalse(s.observe_empty(22, settings))
         self.assertTrue(s.observe_empty(32, settings))
+
+    def test_uvc_camera_opens_reads_and_closes(self):
+        frame = np.zeros((480, 640, 3), dtype=np.uint8)
+        capture = MagicMock()
+        capture.isOpened.return_value = True
+        capture.read.return_value = (True, frame)
+        with patch('monitor.cv2.VideoCapture', return_value=capture) as open_camera:
+            camera = UVCCamera(self.settings)
+            self.assertIs(camera.read(), frame)
+            open_camera.assert_called_once_with('/dev/video0', cv2.CAP_V4L2)
+            self.assertTrue(capture.set.called)
+            camera.close()
+            capture.release.assert_called_once()
+            self.assertIsNone(camera.capture)
+
+    def test_uvc_failure_releases_device_and_reconnects(self):
+        frame = np.zeros((480, 640, 3), dtype=np.uint8)
+        first = MagicMock()
+        first.isOpened.return_value = True
+        first.read.return_value = (False, None)
+        second = MagicMock()
+        second.isOpened.return_value = True
+        second.read.return_value = (True, frame)
+        with patch('monitor.cv2.VideoCapture', side_effect=[first, second]):
+            camera = UVCCamera(self.settings)
+            with self.assertRaises(OSError):
+                camera.read()
+            first.release.assert_called_once()
+            self.assertIs(camera.read(), frame)
+            camera.close()
+            second.release.assert_called_once()
+
+    def test_uvc_unavailable_camera(self):
+        capture = MagicMock()
+        capture.isOpened.return_value = False
+        with patch('monitor.cv2.VideoCapture', return_value=capture):
+            with self.assertRaises(OSError):
+                UVCCamera(self.settings).read()
+            capture.release.assert_called_once()
 
     def test_snapshot_quality_and_encoding(self):
         from monitor import annotated_jpeg, snapshot_quality

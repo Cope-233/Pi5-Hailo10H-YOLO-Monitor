@@ -14,7 +14,7 @@ venv/
 *.pt
 *.onnx
 models/*
-!models/.gitkeep
+!models/yolo26n.hef
 events/
 *.jpg
 *.jpeg

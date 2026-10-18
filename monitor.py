@@ -31,7 +31,11 @@ def env_bool(name: str, default: bool = False) -> bool:
 
 @dataclass(frozen=True)
 class Settings:
-    snapshot_url: str = field(default_factory=lambda: os.getenv("SNAPSHOT_URL", "http://127.0.0.1:8080/snapshot"))
+    camera_device: str = field(default_factory=lambda: os.getenv("CAMERA_DEVICE", "/dev/video0"))
+    camera_width: int = field(default_factory=lambda: int(os.getenv("CAMERA_WIDTH", "640")))
+    camera_height: int = field(default_factory=lambda: int(os.getenv("CAMERA_HEIGHT", "480")))
+    camera_fps: int = field(default_factory=lambda: int(os.getenv("CAMERA_FPS", "15")))
+    camera_fourcc: str = field(default_factory=lambda: os.getenv("CAMERA_FOURCC", "MJPG").upper())
     hef_path: Path = field(default_factory=lambda: Path(os.getenv("HEF_PATH", str(BASE_DIR / "models/yolo26n.hef"))))
     conf_threshold: float = field(default_factory=lambda: float(os.getenv("CONF_THRESHOLD", "0.35")))
     nms_iou_threshold: float = field(default_factory=lambda: float(os.getenv("NMS_IOU_THRESHOLD", "0.45")))
@@ -42,7 +46,6 @@ class Settings:
     snapshot_interval: float = field(default_factory=lambda: float(os.getenv("SNAPSHOT_INTERVAL_SECONDS", "0.5")))
     max_candidates: int = field(default_factory=lambda: int(os.getenv("MAX_SNAPSHOT_CANDIDATES", "60")))
     jpeg_quality: int = field(default_factory=lambda: int(os.getenv("JPEG_QUALITY", "92")))
-    camera_timeout: float = field(default_factory=lambda: float(os.getenv("CAMERA_TIMEOUT_SECONDS", "8")))
     status_interval: float = field(default_factory=lambda: float(os.getenv("STATUS_LOG_INTERVAL_SECONDS", "10")))
     telegram_enabled: bool = field(default_factory=lambda: env_bool("TELEGRAM_ENABLED", True))
     telegram_bot_token: str = field(default_factory=lambda: os.getenv("TELEGRAM_BOT_TOKEN", ""))
@@ -57,12 +60,14 @@ class Settings:
             raise ValueError("TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID are required when Telegram is enabled")
         if not self.hef_path.is_file():
             raise FileNotFoundError(f"Hailo-10H HEF not found: {self.hef_path}")
-        if not self.snapshot_url.startswith(("http://", "https://")):
-            raise ValueError("SNAPSHOT_URL must be an HTTP(S) URL")
+        if not self.camera_device or min(self.camera_width, self.camera_height, self.camera_fps) <= 0:
+            raise ValueError("A camera device, positive dimensions, and FPS are required")
+        if self.camera_fourcc and len(self.camera_fourcc) != 4:
+            raise ValueError("CAMERA_FOURCC must be four characters or empty")
         if not (0 < self.conf_threshold <= 1 and 0 < self.nms_iou_threshold <= 1):
             raise ValueError("Confidence and NMS IoU thresholds must be within (0, 1]")
         if min(self.inference_interval, self.empty_timeout, self.rearm_seconds,
-               self.snapshot_lookback, self.snapshot_interval, self.camera_timeout,
+               self.snapshot_lookback, self.snapshot_interval,
                self.status_interval, self.telegram_retry) <= 0:
             raise ValueError("All timing settings must be greater than zero")
         if self.max_candidates < 1 or not 1 <= self.jpeg_quality <= 100:
@@ -226,13 +231,45 @@ class HailoYOLO26PersonDetector:
             self.device = None
 
 
-def snapshot(session: requests.Session, url: str, timeout: float) -> np.ndarray:
-    response = session.get(url, timeout=timeout, headers={"Cache-Control": "no-cache"})
-    response.raise_for_status()
-    frame = cv2.imdecode(np.frombuffer(response.content, dtype=np.uint8), cv2.IMREAD_COLOR)
-    if frame is None:
-        raise ValueError("Snapshot is not a valid JPEG")
-    return frame
+class UVCCamera:
+    """Read a directly attached, driverless UVC webcam through Linux V4L2.
+
+    A failed read releases the device, allowing the next iteration to reopen it.
+    """
+
+    def __init__(self, settings: Settings):
+        self.settings = settings
+        self.capture: cv2.VideoCapture | None = None
+
+    def open(self) -> None:
+        device = self.settings.camera_device
+        source: str | int = int(device) if device.isdecimal() else device
+        cap = cv2.VideoCapture(source, cv2.CAP_V4L2)
+        if not cap.isOpened():
+            cap.release()
+            raise OSError(f"Cannot open UVC camera: {device}")
+        if self.settings.camera_fourcc:
+            cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*self.settings.camera_fourcc))
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.settings.camera_width)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.settings.camera_height)
+        cap.set(cv2.CAP_PROP_FPS, self.settings.camera_fps)
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        self.capture = cap
+        LOG.info("UVC camera opened: %s", device)
+
+    def read(self) -> np.ndarray:
+        if self.capture is None:
+            self.open()
+        ok, frame = self.capture.read()
+        if not ok or frame is None or frame.size == 0:
+            self.close()
+            raise OSError("UVC camera read failed")
+        return frame
+
+    def close(self) -> None:
+        if self.capture is not None:
+            self.capture.release()
+            self.capture = None
 
 
 def annotated_jpeg(frame: np.ndarray, boxes: np.ndarray, scores: np.ndarray, quality: int) -> bytes | None:
@@ -373,21 +410,21 @@ def run(settings: Settings) -> None:
     detector = HailoYOLO26PersonDetector(settings.hef_path, settings.conf_threshold,
                                          settings.nms_iou_threshold)
     state = MonitorState(candidates=deque(maxlen=settings.max_candidates))
-    with requests.Session() as cam, requests.Session() as tg:
+    camera = UVCCamera(settings)
+    with requests.Session() as tg:
         messenger = Telegram(tg, settings)
         last_log = float("-inf")
         last_camera_error = float("-inf")
         try:
-            LOG.info("Monitoring started; camera=%s", settings.snapshot_url)
+            LOG.info("Monitoring started; camera=%s", settings.camera_device)
             while not STOP:
                 loop_start = time.monotonic()
                 try:
-                    frame = snapshot(cam, settings.snapshot_url, settings.camera_timeout)
+                    frame = camera.read()
                     boxes, scores, infer_ms = detector.detect(frame)
                 except Exception as exc:  # Includes HailoRT device errors; do not treat failure as absence.
                     state.reset_on_error()
                     if time.monotonic() - last_camera_error >= 60:
-                        # Exception text may contain a camera URL with credentials.
                         LOG.warning("Camera/inference error (%s); empty timer reset", type(exc).__name__)
                         last_camera_error = time.monotonic()
                     time.sleep(settings.inference_interval)
@@ -423,6 +460,7 @@ def run(settings: Settings) -> None:
                 if wait > 0:
                     time.sleep(wait)
         finally:
+            camera.close()
             detector.close()
             LOG.info("Monitoring stopped")
 
