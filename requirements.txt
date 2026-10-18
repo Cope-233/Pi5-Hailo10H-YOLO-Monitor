@@ -1,0 +1,5 @@
+# HailoRT's hailo_platform Python bindings are supplied by Hailo's matching wheel,
+# NOT by this PyPI requirements file. Install that wheel separately (see README).
+numpy>=1.26,<3
+opencv-python-headless>=4.10,<5
+requests>=2.31,<3

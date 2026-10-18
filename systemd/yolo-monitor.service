@@ -1,0 +1,13 @@
+[Unit]
+Description=Hailo-10H YOLO26 Empty-Room Monitor
+
+[Service]
+Type=simple
+WorkingDirectory=%h/Pi5-Hailo10H-YOLO-Monitor
+EnvironmentFile=%h/Pi5-Hailo10H-YOLO-Monitor/.env
+ExecStart=%h/hailo-env/.venv/bin/python %h/Pi5-Hailo10H-YOLO-Monitor/monitor.py
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=default.target

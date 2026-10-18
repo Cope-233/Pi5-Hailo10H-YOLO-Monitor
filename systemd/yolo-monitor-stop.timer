@@ -1,0 +1,10 @@
+[Unit]
+Description=Stop Hailo YOLO monitor at 09:00
+
+[Timer]
+OnCalendar=*-*-* 09:00:00
+Unit=yolo-monitor-stop.service
+Persistent=false
+
+[Install]
+WantedBy=timers.target
