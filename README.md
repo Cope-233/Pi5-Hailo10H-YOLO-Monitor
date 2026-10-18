@@ -35,6 +35,10 @@ sudo apt-mark hold hailort h10-hailort-pcie-driver
 
 Use matching **5.4.0 runtime, driver, and wheel**; replace older Raspberry Pi-distributed Hailo-10H packages where present. After future kernel upgrades, rebuild the DKMS driver for the new kernel with `sudo dkms autoinstall -k "$(uname -r)"`.
 
+Recent Raspberry Pi OS 64-bit images may already ship the matching `hailort` runtime and PCIe driver — check `dpkg -l | grep hailo` first and install only what is missing.
+
+> **Note (HailoRT 5.4.0):** there is no manual device-enable step. Before any application loads a HEF, `hailortcli scan` shows the device as `[-]` — that is normal. The `/dev/hailo*` node is created automatically when the monitor loads the model and removed when it exits. Older Hailo docs mention a `hailortcli enable` command that no longer exists in 5.4.0.
+
 ## 2. Install the monitor
 
 ```bash
@@ -47,7 +51,7 @@ python3 -m venv ~/hailo-env/.venv
 ~/hailo-env/.venv/bin/python -m pip install /path/to/hailort-5.4.0-...-linux_aarch64.whl
 ```
 
-The repository already includes **`models/yolo26n.hef`**, compiled for Hailo-10H. The monitor loads this HEF automatically. It expects YOLO26n raw box and class heads, without integrated NMS.
+The repository already includes **`models/yolo26n.hef`**, compiled for Hailo-10H. The monitor loads this HEF automatically. It expects YOLO26n raw box and class heads, without integrated NMS. The bundled HEF has a square 640×640 input; the decoder computes stride from the input width, so a non-square export would need an adjusted HEF.
 
 ## 3. Connect the USB webcam and Telegram
 
@@ -78,6 +82,13 @@ set -a; source .env; set +a
 ```
 
 Have someone enter the camera view, then leave. Once `EMPTY_TIMEOUT_SECONDS` has elapsed, the bot sends a photo. Press Ctrl+C to stop.
+
+To verify the Telegram push without waiting the full 300 s countdown, override the timeout for a single run — variables set after sourcing `.env` take precedence:
+
+```bash
+set -a; source .env; set +a
+EMPTY_TIMEOUT_SECONDS=20 ~/hailo-env/.venv/bin/python monitor.py
+```
 
 ## 4. Run with systemd (optional)
 
